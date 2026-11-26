@@ -47,11 +47,19 @@
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
-          <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-for="column in meta.fields" :key="column">
+            <span
+              v-if="isJsonField(column) && hasValue(row[column])"
+              class="json-cell"
+              :title="formatCell(row[column])"
+              data-testid="json-cell"
+            >{{ compactCell(row[column]) }}</span>
+            <span v-else>{{ hasValue(row[column]) ? row[column] : '—' }}</span>
+          </td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
             <button
-              v-for="action in meta.actions"
+              v-for="action in availableActions(row)"
               :key="action"
               class="link"
               type="button"
@@ -60,6 +68,7 @@
             >
               {{ action }}
             </button>
+            <span v-if="!availableActions(row).length" class="muted">当前状态无可执行动作</span>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -73,7 +82,12 @@
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
-        <label v-for="field in meta.fields" :key="field" class="create-field">
+        <div v-if="meta.key === 'cohort_builder'" class="form-hint" data-testid="cohort-condition-hint">
+          圈选条件支持两种写法：<code>实验编码=E1;分组名称=实验组</code> 或
+          <code>{"实验编码":"E1","分组名称":"实验组"}</code>。
+          实验编码必填，分组名称仅支持 对照组 / 实验组；条件缺失或无法解析将被拒绝，可修正后重新提交。
+        </div>
+        <label v-for="field in createFields" :key="field" class="create-field">
           <span>{{ field }}</span>
           <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
         </label>
@@ -88,7 +102,7 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span v-if="errorMessage" class="error-text" data-testid="page-error">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
@@ -103,6 +117,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import { validateCohortInput } from '@/domain/cohort_builder'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +130,8 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+// 登记表单只出现业务输入字段，系统生成字段（人群规模、确认版本等）由服务端写入
+const createFields = meta.createFields ?? meta.fields
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -129,6 +146,38 @@ const statusSummary = computed(() =>
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+function hasValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false
+  if (Array.isArray(value)) return value.length > 0
+  return String(value).trim() !== ''
+}
+
+function isJsonField(column: string): boolean {
+  return Boolean(meta.jsonFields?.includes(column))
+}
+
+function formatCell(value: unknown): string {
+  if (typeof value === 'string') return value
+  return JSON.stringify(value, null, 2)
+}
+
+function compactCell(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `共 ${value.length} 条（悬停查看明细）`
+  }
+  const text = formatCell(value)
+  return text.length > 24 ? `${text.slice(0, 24)}…` : text
+}
+
+function availableActions(row: EntryRow): string[] {
+  const allowed = meta.actionStatus
+  if (!allowed) return meta.actions
+  return meta.actions.filter((action) => {
+    const statuses = allowed[action]
+    return !statuses || statuses.includes(String(row.status))
+  })
+}
 
 function resetFilters() {
   filters.value = {}
@@ -145,14 +194,22 @@ async function exportRows() {
 }
 
 function openCreate() {
-  createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
+  createValues.value = Object.fromEntries(createFields.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
 }
 
 async function submitCreate() {
-  creating.value = true
   errorMessage.value = ''
+  // 页面侧先校验：人群圈选条件缺失/无法解析时直接提示，不发空包请求
+  if (meta.key === 'cohort_builder') {
+    const reason = validateCohortInput(createValues.value)
+    if (reason) {
+      errorMessage.value = reason
+      return
+    }
+  }
+  creating.value = true
   try {
     const result = await createEntry(meta.key, createValues.value)
     if (!result.ok) throw new Error(result.message)
